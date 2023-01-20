@@ -131,3 +131,12 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/obs_vkcapture${LAYER_SUFFIX}.json
 install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/obs-gamecapture
     src/obs-vkcapture src/obs-glcapture
     DESTINATION "${CMAKE_INSTALL_FULL_BINDIR}")
+
+if (BUILD_PLUGIN)
+	add_executable(vkcapture-kmsgrab src/vkcapture-kmsgrab.c src/capture.c)
+	target_include_directories(vkcapture-kmsgrab PUBLIC /usr/include/libdrm)
+	target_link_libraries(vkcapture-kmsgrab drm)
+
+	install(TARGETS vkcapture-kmsgrab
+	    RUNTIME DESTINATION "${CMAKE_INSTALL_FULL_BINDIR}")
+endif()
