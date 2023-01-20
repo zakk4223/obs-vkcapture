@@ -1,70 +1,44 @@
-#include "capture.h"
-
+#define _POSIX_C_SOURCE 200809L
+#include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
-#define MSG(fmt, ...) printf(fmt "\n", ##__VA_ARGS__)
+#include "capture.h"
 
-#define ASSERT(cond)                                                           \
-  if (!(cond)) {                                                               \
-    MSG("ERROR @ %s:%d: (%s) failed", __FILE__, __LINE__, #cond);              \
-    return 0;                                                                  \
+struct crtc {
+  uint32_t id;
+
+  uint64_t seq;
+  uint64_t ns;
+
+  uint64_t delta_seq;
+  uint64_t delta_ns;
+};
+
+static struct crtc crtcs[64] = {0};
+static size_t crtcs_len = 0;
+
+static int monitor_crtc(int fd, struct crtc *crtc) {
+  uint32_t queue_flags =
+      DRM_CRTC_SEQUENCE_RELATIVE | DRM_CRTC_SEQUENCE_NEXT_ON_MISS;
+  int ret =
+      drmCrtcQueueSequence(fd, crtc->id, queue_flags, 1, NULL, (uint64_t)crtc);
+  if (ret != 0 && errno != EINVAL) {
+    perror("drmCrtcQueueSequence");
+    return ret;
   }
-
-uint32_t lastGoodPlane = 0;
-
-int handle_id = 0;
-drmModeFB2Ptr prepareImage(int drmfd) {
-
-  drmModePlaneResPtr planes = drmModeGetPlaneResources(drmfd);
-
-  // Check the first plane (or last good)
-  drmModePlanePtr plane = drmModeGetPlane(drmfd, planes->planes[lastGoodPlane]);
-  uint32_t fb_id = plane->fb_id;
-  drmModeFreePlane(plane);
-
-  // Find a good plane
-  if (fb_id == 0) {
-    for (uint32_t i = 0; i < planes->count_planes; ++i) {
-      drmModePlanePtr plane = drmModeGetPlane(drmfd, planes->planes[i]);
-
-      if (plane->fb_id != 0) {
-        drmModeFB2Ptr fb = drmModeGetFB2(drmfd, plane->fb_id);
-        if (fb == NULL) {
-          // ctx->lastGoodPlane = 0;
-          continue;
-        }
-        if (fb->handles[handle_id]) {
-          if (fb->width == 256 && fb->height == 256)
-            continue;
-        }
-        // drmModeFreeFB2(fb);
-
-        lastGoodPlane = i;
-        fb_id = plane->fb_id;
-        // MSG("%d, %#x", i, fb_id);
-
-        drmModeFreePlane(plane);
-        return fb;
-        break;
-      } else {
-        drmModeFreePlane(plane);
-      }
-    }
-  } else {
-    return drmModeGetFB2(drmfd, fb_id);
-  }
-
-  drmModeFreePlaneResources(planes);
-
-  // MSG("%#x", fb_id);
-  return NULL;
+  return 0;
 }
 
+int *dma_buf_fd;
 void initDmaBufFDs(int drmfd, drmModeFB2Ptr fb, int *dma_buf_fd, int *nplanes) {
   for (int i = 0; i < 4; i++) {
     if (fb->handles[i] == 0) {
@@ -83,56 +57,107 @@ void cleanupDmaBufFDs(drmModeFB2Ptr fb, int *dma_buf_fd, int *nplanes) {
     drmModeFreeFB2(fb);
 }
 
+static void handle_sequence(int fd, uint64_t seq, uint64_t ns, uint64_t data) {
+  struct crtc *crtc = (struct crtc *)data;
+  assert(seq > crtc->seq);
+  assert(ns > crtc->ns);
+  crtc->delta_seq = seq - crtc->seq;
+  crtc->delta_ns = ns - crtc->ns;
+  crtc->seq = seq;
+  crtc->ns = ns;
+
+  monitor_crtc(fd, crtc);
+  
+  //prepareImage(fd);
+  drmModeCrtcPtr crtc_my = drmModeGetCrtc(fd, crtc->id);
+  if (crtc_my) {
+    drmModeFB2Ptr fb = drmModeGetFB2(fd, crtc_my->buffer_id);
+    drmModeFreeCrtc(crtc_my);
+    
+    //printf("crtc id %d\n", crtc->id);
+    if (fb) {
+      int nplanes = 0;
+      initDmaBufFDs(fd, fb, dma_buf_fd, &nplanes);
+      
+      capture_init_shtex(fb->width, fb->height, DRM_FORMAT_XRGB8888, fb->pitches,
+                         fb->offsets, fb->modifier, 0, false, nplanes, dma_buf_fd);
+      cleanupDmaBufFDs(fb, dma_buf_fd, &nplanes);
+      // capture_update_socket();
+    }
+  }
+}
+
+static const char usage[] =
+    "Usage: drm_monitor [options...]\n"
+    "\n"
+    "  -d              Specify DRM device (default /dev/dri/card0).\n"
+    "  -h              Show help message and quit.\n";
+
 int main(int argc, char *argv[]) {
-  const char *card = "/dev/dri/card0";
-  int drmfd = open(card, O_RDONLY);
-  if (drmfd < 0) {
-    perror("Cannot open card");
+  char *device_path = "/dev/dri/card0";
+  int opt;
+  while ((opt = getopt(argc, argv, "hd:")) != -1) {
+    switch (opt) {
+    case 'h':
+      printf("%s", usage);
+      return EXIT_SUCCESS;
+    case 'd':
+      device_path = optarg;
+      break;
+    default:
+      return EXIT_FAILURE;
+    }
+  }
+  int fd = open(device_path, O_RDONLY);
+  if (fd < 0) {
+    perror("open");
     return 1;
   }
-  drmSetClientCap(drmfd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+  drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
 
-  const int available = drmAvailable();
-  if (!available)
-    return 0;
+  drmModeRes *res = drmModeGetResources(fd);
+  if (res == NULL) {
+    perror("drmModeGetResources");
+    return 1;
+  }
+  assert((size_t)res->count_crtcs < sizeof(crtcs) / sizeof(crtcs[0]));
 
-  // Find DRM video source
-  int *dma_buf_fd = (int *)malloc(sizeof(int) * 4);
+  crtcs_len = (size_t)res->count_crtcs;
+  for (int i = 0; i < res->count_crtcs; i++) {
+    struct crtc *crtc = &crtcs[i];
+    crtc->id = res->crtcs[i];
 
-  drmModeFB2Ptr fb = prepareImage(drmfd);
+    int ret = drmCrtcGetSequence(fd, crtc->id, &crtc->seq, &crtc->ns);
+    if (ret != 0 && errno != EINVAL) {
+      // EINVAL can happen if the CRTC is disabled
+      perror("drmCrtcGetSequence");
+      return 1;
+    }
 
-  int nplanes = 0;
-  initDmaBufFDs(drmfd, fb, dma_buf_fd, &nplanes);
-
-  MSG("Number of planes: %d", nplanes);
-  if (nplanes == 0) {
-    MSG("Not permitted to get fb handles. Run either with sudo, or setcap "
-        "cap_sys_admin+ep %s",
-        argv[0]);
-    cleanupDmaBufFDs(fb, dma_buf_fd, &nplanes);
-    close(drmfd);
-    return 0;
+    if (monitor_crtc(fd, crtc) != 0) {
+      return 1;
+    }
   }
 
-  /*EGLImage eimg = create_dmabuf_egl_image(fb->width, fb->height,
-                                      DRM_FORMAT_XRGB8888, nplanes, dma_buf_fd,
-                                      fb->pitches, fb->offsets, fb->modifier);
-  ASSERT(eimg);*/
+  drmModeFreeResources(res);
+
   capture_init();
   capture_update_socket();
   
-  while (true) {
-    // Find DRM video source
-    cleanupDmaBufFDs(fb, dma_buf_fd, &nplanes);
+  dma_buf_fd = (int *)malloc(sizeof(int) * 4);
 
-    fb = prepareImage(drmfd);
-    initDmaBufFDs(drmfd, fb, dma_buf_fd, &nplanes);
-    
-    capture_init_shtex(fb->width, fb->height, DRM_FORMAT_XRGB8888, fb->pitches,
-                       fb->offsets, fb->modifier, 0, false, nplanes, dma_buf_fd);
-    // capture_update_socket();
-    usleep(1000000/60);
+  while (1) {
+    drmEventContext ctx = {
+        .version = 4,
+        .sequence_handler = handle_sequence,
+    };
+    if (drmHandleEvent(fd, &ctx) != 0) {
+      perror("drmHandleEvent");
+      return 1;
+    }
   }
 
   capture_stop();
+  close(fd);
+  return 0;
 }
