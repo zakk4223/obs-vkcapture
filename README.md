@@ -1,3 +1,11 @@
+# Changes
+Added kmsgrab utility. To activate, compile and install plugin, then run:
+```
+sudo vkcapture-kmsgrab
+```
+
+In list of vkcapture sources you will find "vkcapture-kmsgrab", which is fullscreen capture, universal to X11, Wayland, and even virtual console.
+
 # OBS Linux Vulkan/OpenGL game capture
 
 OBS plugin for Vulkan/OpenGL game capture on Linux.
