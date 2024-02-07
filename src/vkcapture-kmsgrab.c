@@ -1,3 +1,4 @@
+#include <vulkan/vulkan_core.h>
 #define _POSIX_C_SOURCE 200809L
 #include <assert.h>
 #include <errno.h>
@@ -10,6 +11,7 @@
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <vulkan/vulkan.h>
 
 #include "capture.h"
 
@@ -74,13 +76,12 @@ static void handle_sequence(int fd, uint64_t seq, uint64_t ns, uint64_t data) {
     drmModeFB2Ptr fb = drmModeGetFB2(fd, crtc_my->buffer_id);
     drmModeFreeCrtc(crtc_my);
     
-    //printf("crtc id %d\n", crtc->id);
     if (fb) {
       int nplanes = 0;
       initDmaBufFDs(fd, fb, dma_buf_fd, &nplanes);
       
       capture_init_shtex(fb->width, fb->height, DRM_FORMAT_XRGB8888, fb->pitches,
-                         fb->offsets, fb->modifier, 0, false, nplanes, dma_buf_fd);
+                         fb->offsets, fb->modifier, 0, false, VK_COLORSPACE_SRGB_NONLINEAR_KHR, nplanes, dma_buf_fd);
       cleanupDmaBufFDs(fb, dma_buf_fd, &nplanes);
       // capture_update_socket();
     }
@@ -91,12 +92,14 @@ static const char usage[] =
     "Usage: drm_monitor [options...]\n"
     "\n"
     "  -d              Specify DRM device (default /dev/dri/card0).\n"
+	  "  -o              Specify output connector (by name).\n"
     "  -h              Show help message and quit.\n";
 
 int main(int argc, char *argv[]) {
   char *device_path = "/dev/dri/card0";
+	char *use_output_name = NULL;
   int opt;
-  while ((opt = getopt(argc, argv, "hd:")) != -1) {
+  while ((opt = getopt(argc, argv, "hd:o:")) != -1) {
     switch (opt) {
     case 'h':
       printf("%s", usage);
@@ -104,6 +107,9 @@ int main(int argc, char *argv[]) {
     case 'd':
       device_path = optarg;
       break;
+		case 'o':
+			use_output_name = optarg;
+			break;
     default:
       return EXIT_FAILURE;
     }
@@ -122,22 +128,40 @@ int main(int argc, char *argv[]) {
   }
   assert((size_t)res->count_crtcs < sizeof(crtcs) / sizeof(crtcs[0]));
 
-  crtcs_len = (size_t)res->count_crtcs;
-  for (int i = 0; i < res->count_crtcs; i++) {
-    struct crtc *crtc = &crtcs[i];
-    crtc->id = res->crtcs[i];
 
-    int ret = drmCrtcGetSequence(fd, crtc->id, &crtc->seq, &crtc->ns);
-    if (ret != 0 && errno != EINVAL) {
-      // EINVAL can happen if the CRTC is disabled
-      perror("drmCrtcGetSequence");
-      return 1;
-    }
+	char output_name[64] = {0};
+	size_t conn_len = (size_t)res->count_connectors;
+	for (int i = 0; i < conn_len; i++) {
+		int conn_id = res->connectors[i];
+		drmModeConnector *conn = drmModeGetConnector(fd, conn_id); 
+		if (!conn) {
+			continue;
+		}
+		const char *conn_type_name = drmModeGetConnectorTypeName(conn->connector_type);
+		snprintf(output_name, sizeof(output_name), "%s-%d", conn_type_name, conn->connector_type_id);
+		if (conn->connection == DRM_MODE_CONNECTED && (!use_output_name || !strcmp(output_name, use_output_name))) {
+			uint32_t encoder_id = conn->encoder_id;
+			drmModeFreeConnector(conn);
+			drmModeEncoder *encoder = drmModeGetEncoder(fd, encoder_id);
+			if (!encoder) {
+				continue;
+			}
 
-    if (monitor_crtc(fd, crtc) != 0) {
-      return 1;
-    }
-  }
+			uint32_t crtc_id = encoder->crtc_id;
+			drmModeFreeEncoder(encoder);
+			//We're only using one, wasteful, convert to single instance
+			crtcs[0].id = crtc_id;
+			int ret = drmCrtcGetSequence(fd, crtcs[0].id, &crtcs[0].seq, &crtcs[0].ns);
+			if (ret != 0 && errno != EINVAL) {
+				continue;
+			}
+
+			if (monitor_crtc(fd, &crtcs[0]) == 0) {
+				break;
+			}
+
+		}
+	}
 
   drmModeFreeResources(res);
 
